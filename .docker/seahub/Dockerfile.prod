@@ -1,0 +1,53 @@
+# Multi-stage build for the forked Seahub.
+# Final image is a drop-in replacement for seafileltd/seafile-mc:<BASE_TAG>,
+# with /opt/seafile/seafile-server-latest/seahub/ swapped to this fork's source.
+
+ARG BASE_TAG=13.0.21
+
+# ---- Stage 1: build React frontend ---------------------------------------
+FROM node:20-bookworm-slim AS frontend
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json ./frontend/
+RUN cd frontend && npm ci --no-audit --no-fund
+COPY frontend/ ./frontend/
+ENV NODE_OPTIONS=--openssl-legacy-provider
+RUN cd frontend && npm run build
+# Webpack emits to frontend/build/frontend (per frontend/config/paths.js).
+# Upstream's Seahub expects these under media/assets — copied in Stage 3.
+
+# ---- Stage 2: compile Django artifacts (messages, statici18n, collectstatic) ----
+FROM python:3.11-bookworm AS django
+WORKDIR /seahub
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gettext libmariadb-dev pkg-config build-essential libjpeg-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+COPY --from=frontend /build/frontend/build/frontend ./frontend/build/frontend
+# `make dist` runs: compilemessages, compilejsi18n, collectstatic
+RUN python -m django compilemessages -l en -l lv 2>/dev/null || true
+RUN python manage.py compilejsi18n 2>/dev/null || true
+
+# ---- Stage 3: layer over the upstream seafile-mc image -------------------
+FROM seafileltd/seafile-mc:${BASE_TAG} AS final
+
+# Replace bundled seahub with our forked source + built assets
+RUN rm -rf /opt/seafile/seafile-server-latest/seahub
+COPY --from=django /seahub /opt/seafile/seafile-server-latest/seahub
+
+# Install any added Python deps that aren't already in the base image's venv.
+# Base image's seahub-thirdpart/ is on PYTHONPATH; layered deps go alongside.
+RUN if [ -f /opt/seafile/seafile-server-latest/seahub/requirements.txt ]; then \
+        pip install --no-cache-dir --target=/opt/seafile/seafile-server-latest/seahub/thirdpart \
+            -r /opt/seafile/seafile-server-latest/seahub/requirements.txt || true ; \
+    fi
+
+# Entrypoint shim: translates *_FILE env vars (from Docker secrets) into plain
+# env vars, wires the OIDC config from /opt/seafile/conf/seahub_oauth_settings.py,
+# then hands off to upstream's /sbin/my_init supervisor.
+COPY .docker/seahub/entrypoint-shim.sh /usr/local/bin/entrypoint-shim.sh
+RUN chmod +x /usr/local/bin/entrypoint-shim.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-shim.sh"]
+CMD ["/scripts/enterpoint.sh"]
