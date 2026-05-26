@@ -10,6 +10,9 @@ WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json ./frontend/
 RUN cd frontend && npm ci --no-audit --no-fund
 COPY frontend/ ./frontend/
+# Webpack imports reach up into ../../../../../../../media/img/* from sf-table
+# components, so media/ must sit next to frontend/ in this stage's context.
+COPY media/ ./media/
 ENV NODE_OPTIONS=--openssl-legacy-provider
 RUN cd frontend && npm run build
 # Webpack emits to frontend/build/frontend (per frontend/config/paths.js).
